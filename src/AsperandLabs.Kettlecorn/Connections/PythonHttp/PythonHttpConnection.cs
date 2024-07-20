@@ -1,57 +1,90 @@
 using System.Diagnostics;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using AsperandLabs.Kettlecorn.Integration;
 using Microsoft.AspNetCore.Mvc;
 
-namespace AsperandLabs.Kettlecorn.Connections.PythonHttp
+namespace AsperandLabs.Kettlecorn.Connections.PythonHttp;
+
+/// <summary>
+/// A wrapper for the sas workspace to make pooling easier
+/// </summary>
+public class PythonHttpConnection : IConnection
 {
-    /// <summary>
-    /// A wrapper for the sas workspace to make pooling easier
-    /// </summary>
-    public class PythonHttpConnection : IConnection
+    private readonly ILogger<PythonHttpConnection> _log;
+    private readonly int _port;
+    private readonly Process _process;
+    private readonly HttpClient _httpClient;
+    private readonly HashSet<string> _contentHeaders = ["Content-Type", "Content-Length"];
+
+    public PythonHttpConnection(ILogger<PythonHttpConnection> log, int port, Process process)
     {
-        private readonly int _port;
-        private readonly Process _process;
-        private readonly HttpClient _httpClient;
-        private readonly HashSet<string> _contentHeaders = new HashSet<string>{"Content-Type","Content-Length"};
+        _log = log;
+        _port = port;
+        _process = process;
+        _httpClient = new HttpClient();
+        _httpClient.BaseAddress = new Uri($"http://localhost:{port}");
+    }
 
-        public PythonHttpConnection(int port, Process process)
+    public string UniqueIdentifier => $"con:{nameof(PythonHttpConnection)}:{_port}";
+
+    public async Task<IActionResult> Do(PathString path, HttpMethod method, IHeaderDictionary headers, Stream? body = null)
+    {
+        var request = new HttpRequestMessage(method, path);
+        request.Content = new StreamContent(body ?? new MemoryStream());
+        foreach (var header in headers)
         {
-            _port = port;
-            _process = process;
-            _httpClient = new HttpClient();
-            _httpClient.BaseAddress = new Uri($"http://localhost:{port}");
+            if (_contentHeaders.Contains(header.Key))
+                request.Content.Headers.Add(header.Key, header.Value.ToArray());
+            else
+                request.Headers.Add(header.Key, header.Value.ToArray());
         }
 
-        public string UniqueIdentifier => $"con:{nameof(PythonHttpConnection)}:{_port}";
+        var response = await _httpClient.SendAsync(request);
 
-        public async Task<IActionResult> Do(PathString path, HttpMethod method, IHeaderDictionary headers, Stream? body = null)
+        if (response.IsSuccessStatusCode)
+            return new OkObjectResult(await response.Content.ReadAsStreamAsync());
+        return new BadRequestResult();
+    }
+
+    public bool Healthy()
+    {
+        try
         {
-            var request = new HttpRequestMessage(method, path);
-            request.Content = new StreamContent(body ?? new MemoryStream());
-            foreach (var header in headers)
-            {
-                if(_contentHeaders.Contains(header.Key))
-                    request.Content.Headers.Add(header.Key, header.Value.ToArray());
-                else
-                    request.Headers.Add(header.Key, header.Value.ToArray());
-            }
-            
-            var response = await _httpClient.SendAsync(request);
-            
-            if(response.IsSuccessStatusCode)
-                return new OkObjectResult(await response.Content.ReadAsStreamAsync());
-            return new BadRequestResult();
+            var listener = new TcpListener(IPAddress.Any, _port);
+            listener.Start();
+            listener.Stop();
+            return false;
         }
-
-        public void Reset()
+        catch (SocketException)
         {
-            
+            return true;
         }
+    }
 
-
-        public void Dispose()
+    public void Start()
+    {
+        if(!_process.Start())
+            throw new ApplicationException("PythonHttpConnection failed to start.");
+        
+        while (!Healthy())
         {
-            // TODO release managed resources here
+            Thread.Sleep(10);
         }
+        _log.LogInformation("Started PythonHttpConnection on port: {Port}", _port);
+    }
+
+    public void Reset()
+    {
+        _process.Kill();
+        Start();
+    }
+
+
+    public void Dispose()
+    {
+        _process.Kill();
+        _process.Dispose();
     }
 }
